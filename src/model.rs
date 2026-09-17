@@ -729,6 +729,7 @@ pub enum Action {
     FocusSearch,
     FocusComposer,
     HideShortcutHints,
+    DismissChatLockHint,
     ScrollToBottom,
     /// Scrolls the open chat to a message.
     ScrollTo(String),

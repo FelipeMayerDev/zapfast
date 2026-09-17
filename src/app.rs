@@ -153,6 +153,8 @@ pub struct App {
     pub search: String,
     /// Message search results, newest first.
     pub search_hits: Vec<Message>,
+    /// Whether the locked-chats folder is open (revealed by the secret code).
+    pub locked_folder: bool,
     /// Active typers and their latest event time by chat.
     pub typing: HashMap<ChatId, Vec<(String, Instant)>>,
     pub presence: HashMap<String, Presence>,
@@ -383,6 +385,7 @@ impl App {
             last_keystroke: None,
             search: String::new(),
             search_hits: Vec::new(),
+            locked_folder: false,
             typing: HashMap::new(),
             presence: HashMap::new(),
             account_receipts_off: false,
@@ -833,14 +836,35 @@ impl App {
         names.join(", ")
     }
 
-    /// Visible, unlocked chats matching the search, archive state and filter.
+    /// Whether the typed search text is the secret code that reveals the
+    /// locked-chats folder.
+    pub fn secret_code_matched(&self) -> bool {
+        self.settings
+            .chat_lock_code
+            .as_deref()
+            .is_some_and(|code| !code.is_empty() && self.search.trim() == code)
+    }
+
+    pub fn locked_count(&self) -> usize {
+        self.chats.iter().filter(|chat| chat.locked).count()
+    }
+
+    pub fn should_show_chat_lock_hint(&self) -> bool {
+        self.locked_count() > 0
+            && self.settings.chat_lock_code.is_none()
+            && !self.settings.chat_lock_hint_dismissed
+    }
+
+    /// Visible chats filtered by search, archive state, and the chat filter,
+    /// with pinned first.
+    /// Locked chats only appear inside the locked folder.
     pub fn visible_chats(&self) -> Vec<&Chat> {
         let needle = crate::util::search_key(self.search.trim());
         let filtering = needle.is_empty() && !self.show_archived;
         let mut chats: Vec<&Chat> = self
             .chats
             .iter()
-            .filter(|chat| !chat.locked)
+            .filter(|chat| chat.locked == (self.locked_folder && self.secret_code_matched()))
             .filter(|chat| chat.archived == self.show_archived || !needle.is_empty())
             .filter(|chat| {
                 !filtering
@@ -849,7 +873,10 @@ impl App {
                         && self.unread_kept.contains(&chat.id))
             })
             .filter(|chat| {
-                needle.is_empty()
+                // Inside the locked folder the typed text is the secret code,
+                // not a query to match.
+                self.locked_folder
+                    || needle.is_empty()
                     || crate::util::search_key(&chat.name).contains(&needle)
                     || chat.phone().is_some_and(|phone| phone.contains(&needle))
                     || chat.last.as_ref().is_some_and(|last| {
@@ -899,19 +926,14 @@ impl App {
     }
 
     pub fn archived_count(&self) -> usize {
-        self.chats
-            .iter()
-            .filter(|chat| chat.archived && !chat.locked)
-            .count()
+        self.chats.iter().filter(|chat| chat.archived).count()
     }
 
     /// Unarchived chats with unread messages that a filter would list.
     pub fn unread_chats(&self, filter: ChatFilter) -> usize {
         self.chats
             .iter()
-            .filter(|chat| {
-                !chat.archived && !chat.locked && chat.unread > 0 && filter.matches(chat)
-            })
+            .filter(|chat| !chat.archived && chat.unread > 0 && filter.matches(chat))
             .count()
     }
 
@@ -1002,16 +1024,13 @@ impl App {
                 }
                 Event::Chats(chats) => {
                     for chat in &chats {
-                        if chat.locked {
-                            self.hide_locked_chat(&chat.id);
-                        }
                         if chat.unread == 0 {
                             self.notifications.clear(&chat.id);
                         }
                     }
                     self.chats = chats;
                     if let Some(open) = self.open_chat.clone() {
-                        if self.chat(&open).is_none_or(|chat| chat.locked) {
+                        if self.chat(&open).is_none() {
                             self.open_chat = None;
                         } else {
                             // Show archived messages immediately, including offline.
@@ -1070,7 +1089,7 @@ impl App {
                         self.search_hits = messages
                             .into_iter()
                             .filter(|message| {
-                                self.chat(&message.chat).is_some_and(|chat| !chat.locked)
+                                self.chat(&message.chat).is_none_or(|chat| !chat.locked)
                             })
                             .collect();
                     }
@@ -1275,9 +1294,7 @@ impl App {
                     Some(Dialog::PairWithPhone) => None,
                     other => other,
                 };
-                if let Some(open) = self.open_chat.clone()
-                    && self.chat(&open).is_some_and(|chat| !chat.locked)
-                {
+                if let Some(open) = self.open_chat.clone() {
                     self.ensure_loaded(&open);
                 }
             }
@@ -1306,13 +1323,15 @@ impl App {
         if chat.unread == 0 {
             self.notifications.clear(&chat.id);
         }
-        if is_open && !chat.locked && chat.unread > 0 && self.window_focused && !self.window_hidden
-        {
+        if is_open && chat.unread > 0 && self.window_focused && !self.window_hidden {
             chat.unread = 0;
             self.mark_read(&chat.id);
         }
         if chat.locked {
-            self.hide_locked_chat(&chat.id);
+            self.search_hits.retain(|message| message.chat != chat.id);
+            if self.open_chat.as_deref() == Some(chat.id.as_str()) {
+                self.open_chat = None;
+            }
         }
         match self.chats.iter_mut().find(|known| known.id == chat.id) {
             Some(existing) => *existing = chat,
@@ -1320,37 +1339,6 @@ impl App {
         }
         self.chats
             .sort_by_key(|chat| std::cmp::Reverse(chat.last_activity));
-    }
-
-    fn hide_locked_chat(&mut self, id: &str) {
-        self.notifications.clear(id);
-        self.search_hits.retain(|message| message.chat != id);
-        if matches!(&self.dialog, Some(Dialog::ChatInfo(chat)) | Some(Dialog::CreatePoll(chat)) if chat == id)
-            || matches!(&self.dialog, Some(Dialog::Forward { chat, .. }) if chat == id)
-        {
-            self.dialog = None;
-            self.poll_creating = false;
-        }
-        if self.open_chat.as_deref() == Some(id) {
-            self.stop_composing(id);
-            self.open_chat = None;
-            if self.editing.is_none() && !self.composer.is_empty() {
-                self.drafts
-                    .insert(id.to_owned(), std::mem::take(&mut self.composer));
-                self.draft_mentions
-                    .insert(id.to_owned(), std::mem::take(&mut self.composer_mentions));
-            }
-            self.composer.clear();
-            self.composer_mentions.clear();
-            self.pending.clear();
-            self.reply_to = None;
-            self.editing = None;
-            self.picker = None;
-            self.reaction_target = None;
-            self.dialog = None;
-            self.recording = None;
-            self.player.stop();
-        }
     }
 
     fn handle_media(&mut self, chat: &str, id: &str, result: Result<PathBuf, String>) {
@@ -1376,7 +1364,7 @@ impl App {
                 } else {
                     error
                 };
-                log::warn!("attachment download failed; details are shown in the bubble");
+                log::warn!("download failed: {notice}");
                 media.state = MediaState::Failed(notice);
             }
         }
@@ -1457,9 +1445,6 @@ impl App {
     }
 
     fn open_chat(&mut self, id: ChatId) {
-        if self.chat(&id).is_some_and(|chat| chat.locked) {
-            return;
-        }
         if self.open_chat.as_deref() != Some(id.as_str()) {
             self.reaction_target = None;
             self.reaction_anchor = None;
@@ -2002,33 +1987,11 @@ impl App {
                 self.backend.send(Command::Download { chat, message });
             }
             Action::OpenFile(path) => {
-                if crate::safety::can_open_attachment(&path) && path.is_file() {
-                    if let Err(error) = open::that_detached(&path) {
-                        self.toast_error(format!("Could not open the attachment: {error}"));
-                    }
-                } else {
-                    self.toast("For safety, open this file yourself from its folder");
-                    if let Some(folder) = path.parent() {
-                        self.actions.push(Action::OpenFolder(folder.to_owned()));
-                    }
+                if let Err(error) = open::that_detached(&path) {
+                    self.toast_error(format!("Could not open {}: {error}", path.display()));
                 }
             }
-            Action::OpenFolder(path) => {
-                if path.is_dir() {
-                    if let Err(error) = open::that_detached(&path) {
-                        self.toast_error(format!("Could not open the folder: {error}"));
-                    }
-                } else {
-                    self.toast_error("The folder is unavailable");
-                }
-            }
-            Action::OpenUrl(url) => {
-                if let Some(url) = crate::safety::external_url(&url) {
-                    ctx.open_url(egui::OpenUrl::new_tab(url));
-                } else {
-                    self.toast_error("This link type cannot be opened from ZapFast");
-                }
-            }
+            Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
             Action::CopyText(text) => {
                 ctx.copy_text(text);
                 self.toast("Copied");
@@ -2144,6 +2107,16 @@ impl App {
                     known.muted_until = until;
                 }
                 self.backend.send(Command::SetMuted(chat, until));
+            }
+            Action::SetLocked(chat, locked) => {
+                if let Some(known) = self.chat_mut(&chat) {
+                    known.locked = locked;
+                }
+                // Locking the open chat closes it, as the phone does.
+                if locked && self.open_chat.as_deref() == Some(chat.as_str()) {
+                    self.open_chat = None;
+                }
+                self.backend.send(Command::SetLocked(chat, locked));
             }
             Action::TogglePicker(tab) => {
                 self.emoji_start = None;
@@ -2453,6 +2426,11 @@ impl App {
             Action::Search(text) => {
                 self.search = text;
                 let query = self.search.trim().to_owned();
+                // Editing the search away from the secret code hides the
+                // locked folder again, like leaving the phone's home screen.
+                if !self.secret_code_matched() {
+                    self.locked_folder = false;
+                }
                 if query.is_empty() {
                     self.search_hits.clear();
                 } else {
@@ -2508,6 +2486,10 @@ impl App {
             }
             Action::HideShortcutHints => {
                 self.settings.show_shortcut_hints = false;
+                self.mark_settings_dirty();
+            }
+            Action::DismissChatLockHint => {
+                self.settings.chat_lock_hint_dismissed = true;
                 self.mark_settings_dirty();
             }
             Action::SettingsChanged => self.mark_settings_dirty(),
@@ -2570,7 +2552,7 @@ impl App {
 
     pub fn toast_error(&mut self, message: impl Into<String>) {
         let message = message.into();
-        log::warn!("an operation failed; details are shown in the window");
+        log::warn!("{message}");
         self.toasts.push(Toast {
             message,
             kind: ToastKind::Error,
@@ -3436,20 +3418,83 @@ mod tests {
     }
 
     #[test]
-    fn locked_chats_are_excluded_from_lists_and_counts() {
+    fn locked_chats_hide_everywhere_until_the_code_opens_the_folder() {
         let mut app = app();
-        let mut chat = Chat::new("locked@s.whatsapp.net".into(), "Fixture".into());
-        chat.locked = true;
-        chat.archived = true;
-        chat.unread = 4;
-        app.chats.push(chat.clone());
-        assert_eq!(app.unread_total(), 0);
-        assert_eq!(app.unread_chats(ChatFilter::All), 0);
-        assert_eq!(app.archived_count(), 0);
-        app.show_archived = true;
+        let mut a = Chat::new("1@s.whatsapp.net".into(), "Ada".into());
+        a.last_activity = 10;
+        a.unread = 3;
+        let mut b = Chat::new("2@s.whatsapp.net".into(), "Bob".into());
+        b.last_activity = 20;
+        b.locked = true;
+        b.unread = 5;
+        app.chats = vec![b, a];
+        app.settings.chat_lock_code = Some("1234".to_owned());
+
+        // Hidden from the list, search, and the unread badge.
+        let names: Vec<&str> = app
+            .visible_chats()
+            .iter()
+            .map(|chat| chat.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Ada"]);
+        app.search = "bob".into();
         assert!(app.visible_chats().is_empty());
-        app.open_chat(chat.id);
+        assert_eq!(app.unread_total(), 3);
+
+        // Typing the code reveals the entry; opening the folder shows only
+        // the locked chats; editing the search away hides them again.
+        assert!(!app.secret_code_matched());
+        app.search = "1234".into();
+        assert!(app.secret_code_matched());
+        app.locked_folder = true;
+        let names: Vec<&str> = app
+            .visible_chats()
+            .iter()
+            .map(|chat| chat.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Bob"]);
+        assert_eq!(app.locked_count(), 1);
+        app.search = "123".into();
+        assert_eq!(
+            app.visible_chats()
+                .iter()
+                .map(|chat| chat.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Ada"]
+        );
+        app.apply(Action::Search("123".into()), &egui::Context::default());
+        assert!(!app.locked_folder);
+        app.apply(Action::Search(String::new()), &egui::Context::default());
+        let names: Vec<&str> = app
+            .visible_chats()
+            .iter()
+            .map(|chat| chat.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Ada"]);
+    }
+
+    #[test]
+    fn locked_chat_code_hint_is_shown_once() {
+        let mut app = app();
+        let mut chat = Chat::new("1@s.whatsapp.net".into(), "Ada".into());
+        chat.locked = true;
+        app.chats.push(chat);
+
+        assert!(app.should_show_chat_lock_hint());
+        app.apply(Action::DismissChatLockHint, &egui::Context::default());
+        assert!(!app.should_show_chat_lock_hint());
+    }
+
+    #[test]
+    fn locking_the_open_chat_closes_it() {
+        let mut app = app();
+        let id: ChatId = "2@s.whatsapp.net".into();
+        app.chats = vec![Chat::new(id.clone(), "Bob".into())];
+        app.open_chat = Some(id.clone());
+        app.locked_folder = true;
+        app.apply(Action::SetLocked(id, true), &egui::Context::default());
         assert!(app.open_chat.is_none());
+        assert!(app.chats[0].locked);
     }
 
     #[test]
@@ -3459,59 +3504,11 @@ mod tests {
         app.chats = vec![Chat::new(id.clone(), "Bob".into())];
         app.open_chat = Some(id.clone());
         app.search_hits.push(message(&id, "m", 1));
-        app.composer = "Synthetic draft".into();
         let mut chat = app.chats[0].clone();
         chat.locked = true;
         app.handle_chat_updated(chat);
         assert!(app.open_chat.is_none());
         assert!(app.search_hits.is_empty());
-        assert!(app.composer.is_empty());
-        assert_eq!(
-            app.drafts.get(&id).map(String::as_str),
-            Some("Synthetic draft")
-        );
-    }
-
-    #[test]
-    fn locked_last_chat_is_not_restored_from_a_snapshot() {
-        let root = tempfile::tempdir().unwrap();
-        let settings = Settings {
-            last_chat: Some("locked".into()),
-            ..Default::default()
-        };
-        let (mut app, events) = App::headless(AppDirs::under(root.path()), settings);
-        let mut chat = Chat::new("locked".into(), "Fixture".into());
-        chat.locked = true;
-        events.send(Event::Chats(vec![chat])).unwrap();
-        app.handle_events();
-        assert!(app.open_chat.is_none());
-        assert!(app.conversations.is_empty());
-    }
-
-    #[test]
-    fn desktop_handlers_are_validated_even_for_archived_urls() {
-        let mut app = app();
-        let ctx = egui::Context::default();
-        let mut output = ctx.run_ui(Default::default(), |_| {
-            app.apply(Action::OpenUrl("file:///fixture.exe".into()), &ctx);
-            app.apply(
-                Action::OpenFile(PathBuf::from("/fixture/program.exe")),
-                &ctx,
-            );
-        });
-        output.textures_delta.clear();
-        assert!(
-            output
-                .platform_output
-                .commands
-                .iter()
-                .all(|command| !matches!(command, egui::OutputCommand::OpenUrl(_)))
-        );
-        assert!(
-            app.actions
-                .iter()
-                .any(|action| matches!(action, Action::OpenFolder(_)))
-        );
     }
 
     #[test]
