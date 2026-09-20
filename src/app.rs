@@ -839,10 +839,7 @@ impl App {
     /// Whether the typed search text is the secret code that reveals the
     /// locked-chats folder.
     pub fn secret_code_matched(&self) -> bool {
-        self.settings
-            .chat_lock_code
-            .as_deref()
-            .is_some_and(|code| !code.is_empty() && self.search.trim() == code)
+        self.settings.verifies_chat_lock_code(self.search.trim())
     }
 
     pub fn locked_count(&self) -> usize {
@@ -851,7 +848,7 @@ impl App {
 
     pub fn should_show_chat_lock_hint(&self) -> bool {
         self.locked_count() > 0
-            && self.settings.chat_lock_code.is_none()
+            && self.settings.chat_lock_code_hash.is_none()
             && !self.settings.chat_lock_hint_dismissed
     }
 
@@ -933,7 +930,9 @@ impl App {
     pub fn unread_chats(&self, filter: ChatFilter) -> usize {
         self.chats
             .iter()
-            .filter(|chat| !chat.archived && chat.unread > 0 && filter.matches(chat))
+            .filter(|chat| {
+                !chat.archived && !chat.locked && chat.unread > 0 && filter.matches(chat)
+            })
             .count()
     }
 
@@ -1030,7 +1029,7 @@ impl App {
                     }
                     self.chats = chats;
                     if let Some(open) = self.open_chat.clone() {
-                        if self.chat(&open).is_none() {
+                        if self.chat(&open).is_none_or(|chat| chat.locked) {
                             self.open_chat = None;
                         } else {
                             // Show archived messages immediately, including offline.
@@ -1989,6 +1988,13 @@ impl App {
             Action::OpenFile(path) => {
                 if let Err(error) = open::that_detached(&path) {
                     self.toast_error(format!("Could not open {}: {error}", path.display()));
+                }
+            }
+            Action::OpenFolder(path) => {
+                if path.is_dir()
+                    && let Err(error) = open::that_detached(&path)
+                {
+                    self.toast_error(format!("Could not open the folder: {error}"));
                 }
             }
             Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
@@ -3428,7 +3434,7 @@ mod tests {
         b.locked = true;
         b.unread = 5;
         app.chats = vec![b, a];
-        app.settings.chat_lock_code = Some("1234".to_owned());
+        app.settings.set_chat_lock_code(Some("1234"));
 
         // Hidden from the list, search, and the unread badge.
         let names: Vec<&str> = app
@@ -3440,6 +3446,7 @@ mod tests {
         app.search = "bob".into();
         assert!(app.visible_chats().is_empty());
         assert_eq!(app.unread_total(), 3);
+        assert_eq!(app.unread_chats(ChatFilter::All), 1);
 
         // Typing the code reveals the entry; opening the folder shows only
         // the locked chats; editing the search away hides them again.
@@ -3509,6 +3516,22 @@ mod tests {
         app.handle_chat_updated(chat);
         assert!(app.open_chat.is_none());
         assert!(app.search_hits.is_empty());
+    }
+
+    #[test]
+    fn locked_last_chat_is_not_restored_from_a_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            last_chat: Some("locked".into()),
+            ..Default::default()
+        };
+        let (mut app, events) = App::headless(AppDirs::under(root.path()), settings);
+        let mut chat = Chat::new("locked".into(), "Fixture".into());
+        chat.locked = true;
+        events.send(Event::Chats(vec![chat])).unwrap();
+        app.handle_events();
+        assert!(app.open_chat.is_none());
+        assert!(app.conversations.is_empty());
     }
 
     #[test]

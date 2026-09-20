@@ -78,8 +78,6 @@ pub struct Chat {
     pub pinned_at: i64,
     /// Mute end as Unix seconds; `Some(0)` means indefinite.
     pub muted_until: Option<i64>,
-    /// Chat lock: the chat lives in the locked folder, behind the secret code.
-    pub locked: bool,
     /// Latest message shown in the chat list.
     pub last: Option<LastMessage>,
     /// Canonical group-member ids, empty until loaded.
@@ -115,7 +113,6 @@ impl Chat {
             pinned: false,
             pinned_at: 0,
             muted_until: None,
-            locked: false,
             last: None,
             participants: Vec::new(),
             read_only: false,

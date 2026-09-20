@@ -123,7 +123,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     toggle(ui, app, "Show shortcut hints", "", |settings| &mut settings.show_shortcut_hints);
 
                     {
-                        let mut code = app.settings.chat_lock_code.clone().unwrap_or_default();
+                        let mut code = String::new();
                         widgets::setting_row(
                             ui,
                             &palette,
@@ -140,8 +140,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                 );
                                 if response.changed() {
                                     let trimmed = code.trim().to_owned();
-                                    app.settings.chat_lock_code =
-                                        (!trimmed.is_empty()).then_some(trimmed);
+                                    app.settings.set_chat_lock_code(Some(&trimmed));
+                                    app.actions.push(Action::SettingsChanged);
+                                }
+                                if app.settings.chat_lock_code_hash.is_some()
+                                    && ui.small_button("Clear").clicked()
+                                {
+                                    app.settings.set_chat_lock_code(None);
                                     app.actions.push(Action::SettingsChanged);
                                 }
                             },

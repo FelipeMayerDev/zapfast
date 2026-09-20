@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -78,8 +79,11 @@ pub struct Settings {
     pub voice_speed: f32,
     /// Also add saved contacts to the phone's address book.
     pub save_contacts_to_phone: bool,
-    /// Secret code that reveals the locked-chats folder in search.
+    /// Legacy plaintext code, accepted once and rewritten as a verifier.
+    #[serde(skip_serializing)]
     pub chat_lock_code: Option<String>,
+    /// SHA-256 verifier for the local locked-chats code.
+    pub chat_lock_code_hash: Option<String>,
     /// The one-time locked-chat code hint has been opened.
     pub chat_lock_hint_dismissed: bool,
 }
@@ -110,6 +114,7 @@ impl Default for Settings {
             save_contacts_to_phone: true,
             voice_speed: 1.0,
             chat_lock_code: None,
+            chat_lock_code_hash: None,
             chat_lock_hint_dismissed: false,
         }
     }
@@ -148,8 +153,16 @@ impl Settings {
 
     pub fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(contents) => match serde_json::from_str(&contents) {
-                Ok(settings) => settings,
+            Ok(contents) => match serde_json::from_str::<Self>(&contents) {
+                Ok(mut settings) => {
+                    if let Some(code) = settings.chat_lock_code.take() {
+                        settings.set_chat_lock_code(Some(&code));
+                        if let Err(error) = settings.save(path) {
+                            log::warn!("could not replace the legacy locked-chat code: {error}");
+                        }
+                    }
+                    settings
+                }
                 Err(_error) => {
                     log::warn!("settings file is unreadable, using defaults");
                     Self::default()
@@ -172,6 +185,27 @@ impl Settings {
         let temp = path.with_extension("json.tmp");
         std::fs::write(&temp, contents)?;
         std::fs::rename(&temp, path)
+    }
+
+    pub fn set_chat_lock_code(&mut self, code: Option<&str>) {
+        self.chat_lock_code = None;
+        self.chat_lock_code_hash = code
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .map(Self::chat_lock_code_hash);
+    }
+
+    pub fn verifies_chat_lock_code(&self, code: &str) -> bool {
+        self.chat_lock_code_hash
+            .as_deref()
+            .is_some_and(|hash| hash == Self::chat_lock_code_hash(code.trim()))
+    }
+
+    fn chat_lock_code_hash(code: &str) -> String {
+        Sha256::digest(code.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 }
 
@@ -210,6 +244,16 @@ mod tests {
         settings.save(&path).expect("saves");
         assert_eq!(Settings::load(&path), settings);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_locked_chat_code_is_rewritten_as_a_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"chat_lock_code":"1234"}"#).unwrap();
+        let settings = Settings::load(&path);
+        assert!(settings.verifies_chat_lock_code("1234"));
+        assert!(!std::fs::read_to_string(path).unwrap().contains("1234"));
     }
 }
 
