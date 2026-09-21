@@ -842,6 +842,11 @@ impl App {
         self.settings.verifies_chat_lock_code(self.search.trim())
     }
 
+    /// Whether the locked folder is open with the code currently typed.
+    pub fn locked_folder_open(&self) -> bool {
+        self.locked_folder && self.secret_code_matched()
+    }
+
     pub fn locked_count(&self) -> usize {
         self.chats.iter().filter(|chat| chat.locked).count()
     }
@@ -861,7 +866,7 @@ impl App {
         let mut chats: Vec<&Chat> = self
             .chats
             .iter()
-            .filter(|chat| chat.locked == (self.locked_folder && self.secret_code_matched()))
+            .filter(|chat| chat.locked == self.locked_folder_open())
             .filter(|chat| chat.archived == self.show_archived || !needle.is_empty())
             .filter(|chat| {
                 !filtering
@@ -923,7 +928,10 @@ impl App {
     }
 
     pub fn archived_count(&self) -> usize {
-        self.chats.iter().filter(|chat| chat.archived).count()
+        self.chats
+            .iter()
+            .filter(|chat| chat.archived && !chat.locked)
+            .count()
     }
 
     /// Unarchived chats with unread messages that a filter would list.
@@ -1322,15 +1330,19 @@ impl App {
         if chat.unread == 0 {
             self.notifications.clear(&chat.id);
         }
-        if is_open && chat.unread > 0 && self.window_focused && !self.window_hidden {
+        if is_open
+            && (!chat.locked || self.locked_folder_open())
+            && chat.unread > 0
+            && self.window_focused
+            && !self.window_hidden
+        {
             chat.unread = 0;
             self.mark_read(&chat.id);
         }
-        if chat.locked {
-            self.search_hits.retain(|message| message.chat != chat.id);
-            if self.open_chat.as_deref() == Some(chat.id.as_str()) {
-                self.open_chat = None;
-            }
+        // Inside the authenticated folder the chat stays open; otherwise a
+        // lock closes and clears everything it left behind.
+        if chat.locked && !self.locked_folder_open() {
+            self.hide_locked_chat(&chat.id);
         }
         match self.chats.iter_mut().find(|known| known.id == chat.id) {
             Some(existing) => *existing = chat,
@@ -1338,6 +1350,37 @@ impl App {
         }
         self.chats
             .sort_by_key(|chat| std::cmp::Reverse(chat.last_activity));
+    }
+
+    fn hide_locked_chat(&mut self, id: &str) {
+        self.notifications.clear(id);
+        self.search_hits.retain(|message| message.chat != id);
+        if matches!(&self.dialog, Some(Dialog::ChatInfo(chat)) | Some(Dialog::CreatePoll(chat)) if chat == id)
+            || matches!(&self.dialog, Some(Dialog::Forward { chat, .. }) if chat == id)
+        {
+            self.dialog = None;
+            self.poll_creating = false;
+        }
+        if self.open_chat.as_deref() == Some(id) {
+            self.stop_composing(id);
+            self.open_chat = None;
+            if self.editing.is_none() && !self.composer.is_empty() {
+                self.drafts
+                    .insert(id.to_owned(), std::mem::take(&mut self.composer));
+                self.draft_mentions
+                    .insert(id.to_owned(), std::mem::take(&mut self.composer_mentions));
+            }
+            self.composer.clear();
+            self.composer_mentions.clear();
+            self.pending.clear();
+            self.reply_to = None;
+            self.editing = None;
+            self.picker = None;
+            self.reaction_target = None;
+            self.dialog = None;
+            self.recording = None;
+            self.player.stop();
+        }
     }
 
     fn handle_media(&mut self, chat: &str, id: &str, result: Result<PathBuf, String>) {
@@ -1363,7 +1406,7 @@ impl App {
                 } else {
                     error
                 };
-                log::warn!("download failed: {notice}");
+                log::warn!("attachment download failed; details are shown in the bubble");
                 media.state = MediaState::Failed(notice);
             }
         }
@@ -1444,6 +1487,11 @@ impl App {
     }
 
     fn open_chat(&mut self, id: ChatId) {
+        // Notifications and stale actions must not open a locked chat from
+        // outside the authenticated folder.
+        if self.chat(&id).is_some_and(|chat| chat.locked) && !self.locked_folder_open() {
+            return;
+        }
         if self.open_chat.as_deref() != Some(id.as_str()) {
             self.reaction_target = None;
             self.reaction_anchor = None;
@@ -1986,18 +2034,33 @@ impl App {
                 self.backend.send(Command::Download { chat, message });
             }
             Action::OpenFile(path) => {
-                if let Err(error) = open::that_detached(&path) {
-                    self.toast_error(format!("Could not open {}: {error}", path.display()));
+                if crate::safety::can_open_attachment(&path) && path.is_file() {
+                    if let Err(error) = open::that_detached(&path) {
+                        self.toast_error(format!("Could not open the attachment: {error}"));
+                    }
+                } else {
+                    self.toast("For safety, open this file yourself from its folder");
+                    if let Some(folder) = path.parent() {
+                        self.actions.push(Action::OpenFolder(folder.to_owned()));
+                    }
                 }
             }
             Action::OpenFolder(path) => {
-                if path.is_dir()
-                    && let Err(error) = open::that_detached(&path)
-                {
-                    self.toast_error(format!("Could not open the folder: {error}"));
+                if path.is_dir() {
+                    if let Err(error) = open::that_detached(&path) {
+                        self.toast_error(format!("Could not open the folder: {error}"));
+                    }
+                } else {
+                    self.toast_error("The folder is unavailable");
                 }
             }
-            Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+            Action::OpenUrl(url) => {
+                if let Some(url) = crate::safety::external_url(&url) {
+                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                } else {
+                    self.toast_error("This link type cannot be opened from ZapFast");
+                }
+            }
             Action::CopyText(text) => {
                 ctx.copy_text(text);
                 self.toast("Copied");
@@ -2558,7 +2621,7 @@ impl App {
 
     pub fn toast_error(&mut self, message: impl Into<String>) {
         let message = message.into();
-        log::warn!("{message}");
+        log::warn!("an operation failed; details are shown in the window");
         self.toasts.push(Toast {
             message,
             kind: ToastKind::Error,
@@ -3511,11 +3574,55 @@ mod tests {
         app.chats = vec![Chat::new(id.clone(), "Bob".into())];
         app.open_chat = Some(id.clone());
         app.search_hits.push(message(&id, "m", 1));
+        app.composer = "Synthetic draft".into();
         let mut chat = app.chats[0].clone();
+        chat.archived = true;
         chat.locked = true;
         app.handle_chat_updated(chat);
         assert!(app.open_chat.is_none());
         assert!(app.search_hits.is_empty());
+        assert!(app.composer.is_empty());
+        assert_eq!(
+            app.drafts.get(&id).map(String::as_str),
+            Some("Synthetic draft")
+        );
+        // A locked chat never contributes an archived row either.
+        assert_eq!(app.archived_count(), 0);
+
+        // Reopening it needs the folder open with the code typed.
+        app.open_chat(id.clone());
+        assert!(app.open_chat.is_none());
+        app.settings.set_chat_lock_code(Some("1234"));
+        app.search = "1234".into();
+        app.locked_folder = true;
+        app.open_chat(id.clone());
+        assert_eq!(app.open_chat.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn desktop_handlers_are_validated_even_for_archived_urls() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |_| {
+            app.apply(Action::OpenUrl("file:///fixture.exe".into()), &ctx);
+            app.apply(
+                Action::OpenFile(PathBuf::from("/fixture/program.exe")),
+                &ctx,
+            );
+        });
+        output.textures_delta.clear();
+        assert!(
+            output
+                .platform_output
+                .commands
+                .iter()
+                .all(|command| !matches!(command, egui::OutputCommand::OpenUrl(_)))
+        );
+        assert!(
+            app.actions
+                .iter()
+                .any(|action| matches!(action, Action::OpenFolder(_)))
+        );
     }
 
     #[test]

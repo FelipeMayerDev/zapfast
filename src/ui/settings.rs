@@ -123,7 +123,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     toggle(ui, app, "Show shortcut hints", "", |settings| &mut settings.show_shortcut_hints);
 
                     {
-                        let mut code = String::new();
+                        // The buffer lives in egui memory: the hash is the only
+                        // stored form, so there is nothing to read it back from.
+                        let code_id = ui.id().with("chat_lock_code");
+                        let mut code: String =
+                            ui.data_mut(|data| data.get_temp(code_id).unwrap_or_default());
                         widgets::setting_row(
                             ui,
                             &palette,
@@ -146,9 +150,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                 if app.settings.chat_lock_code_hash.is_some()
                                     && ui.small_button("Clear").clicked()
                                 {
+                                    code.clear();
                                     app.settings.set_chat_lock_code(None);
                                     app.actions.push(Action::SettingsChanged);
                                 }
+                                ui.data_mut(|data| data.insert_temp(code_id, code));
                             },
                         );
                     }
