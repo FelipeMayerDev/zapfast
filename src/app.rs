@@ -155,6 +155,8 @@ pub struct App {
     pub search_hits: Vec<Message>,
     /// Whether the locked-chats folder is open (revealed by the secret code).
     pub locked_folder: bool,
+    /// Last answer from the slow code verifier, keyed by what was checked.
+    chat_lock_check: std::cell::RefCell<Option<(String, Option<String>, bool)>>,
     /// Active typers and their latest event time by chat.
     pub typing: HashMap<ChatId, Vec<(String, Instant)>>,
     pub presence: HashMap<String, Presence>,
@@ -386,6 +388,7 @@ impl App {
             search: String::new(),
             search_hits: Vec::new(),
             locked_folder: false,
+            chat_lock_check: Default::default(),
             typing: HashMap::new(),
             presence: HashMap::new(),
             account_receipts_off: false,
@@ -839,7 +842,20 @@ impl App {
     /// Whether the typed search text is the secret code that reveals the
     /// locked-chats folder.
     pub fn secret_code_matched(&self) -> bool {
-        self.settings.verifies_chat_lock_code(self.search.trim())
+        // Verifying runs a slow KDF, and this is read every frame, so the
+        // answer is kept until the typed text or the stored verifier changes.
+        let code = self.search.trim();
+        let stored = &self.settings.chat_lock_code_hash;
+        let mut cached = self.chat_lock_check.borrow_mut();
+        if let Some((checked, against, matched)) = cached.as_ref()
+            && checked == code
+            && against == stored
+        {
+            return *matched;
+        }
+        let matched = self.settings.verifies_chat_lock_code(code);
+        *cached = Some((code.to_owned(), stored.clone(), matched));
+        matched
     }
 
     /// Whether the locked folder is open with the code currently typed.

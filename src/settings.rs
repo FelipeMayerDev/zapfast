@@ -3,7 +3,27 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
+/// Verifying the locked-chat code costs about 20 ms, paid once per distinct
+/// typed string. ponytail: fixed cost, revisit if it lags the search field.
+const CHAT_LOCK_ROUNDS: std::num::NonZeroU32 = std::num::NonZeroU32::new(200_000).unwrap();
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn unhex(value: &str) -> Option<Vec<u8>> {
+    value
+        .len()
+        .is_multiple_of(2)
+        .then(|| {
+            (0..value.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&value[at..at + 2], 16).ok())
+                .collect()
+        })
+        .flatten()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -82,7 +102,7 @@ pub struct Settings {
     /// Legacy plaintext code, accepted once and rewritten as a verifier.
     #[serde(skip_serializing)]
     pub chat_lock_code: Option<String>,
-    /// SHA-256 verifier for the local locked-chats code.
+    /// Salted PBKDF2 verifier for the local locked-chats code, `salt$hash`.
     pub chat_lock_code_hash: Option<String>,
     /// The one-time locked-chat code hint has been opened.
     pub chat_lock_hint_dismissed: bool,
@@ -192,20 +212,46 @@ impl Settings {
         self.chat_lock_code_hash = code
             .map(str::trim)
             .filter(|code| !code.is_empty())
-            .map(Self::chat_lock_code_hash);
+            .map(Self::chat_lock_verifier);
     }
 
+    /// Checking is deliberately slow, so callers memoize the answer.
     pub fn verifies_chat_lock_code(&self, code: &str) -> bool {
-        self.chat_lock_code_hash
+        let Some((salt, expected)) = self
+            .chat_lock_code_hash
             .as_deref()
-            .is_some_and(|hash| hash == Self::chat_lock_code_hash(code.trim()))
+            .and_then(|stored| stored.split_once('$'))
+        else {
+            return false;
+        };
+        let (Some(salt), Some(expected)) = (unhex(salt), unhex(expected)) else {
+            return false;
+        };
+        ring::pbkdf2::verify(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            CHAT_LOCK_ROUNDS,
+            &salt,
+            code.trim().as_bytes(),
+            &expected,
+        )
+        .is_ok()
     }
 
-    fn chat_lock_code_hash(code: &str) -> String {
-        Sha256::digest(code.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+    /// `salt$hash`, both hex. Codes are short enough to be guessed offline,
+    /// so the stored form is salted and slow rather than a bare digest.
+    fn chat_lock_verifier(code: &str) -> String {
+        let salt: [u8; 16] = ring::rand::generate(&ring::rand::SystemRandom::new())
+            .expect("the system random generator is unavailable")
+            .expose();
+        let mut hash = [0u8; 32];
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            CHAT_LOCK_ROUNDS,
+            &salt,
+            code.as_bytes(),
+            &mut hash,
+        );
+        format!("{}${}", hex(&salt), hex(&hash))
     }
 }
 
@@ -244,6 +290,22 @@ mod tests {
         settings.save(&path).expect("saves");
         assert_eq!(Settings::load(&path), settings);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_locked_chat_verifier_is_salted_and_rejects_other_codes() {
+        let mut settings = Settings::default();
+        settings.set_chat_lock_code(Some(" 1234 "));
+        assert!(settings.verifies_chat_lock_code("1234"));
+        assert!(!settings.verifies_chat_lock_code("1235"));
+        assert!(!settings.verifies_chat_lock_code(""));
+        let first = settings.chat_lock_code_hash.clone();
+        settings.set_chat_lock_code(Some("1234"));
+        // A fresh salt every time, so the same code never stores the same value.
+        assert_ne!(first, settings.chat_lock_code_hash);
+        assert!(settings.verifies_chat_lock_code("1234"));
+        settings.set_chat_lock_code(None);
+        assert!(!settings.verifies_chat_lock_code("1234"));
     }
 
     #[test]
